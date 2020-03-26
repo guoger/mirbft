@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	pb "github.com/IBM/mirbft/mirbftpb"
+	"go.uber.org/zap"
 )
 
 // epochConfig is the information required by the various
@@ -25,6 +26,9 @@ type epochConfig struct {
 	plannedExpiration uint64
 
 	networkConfig *pb.NetworkConfig
+
+	// leaders is the set of nodes which will act as leaders in this epoch
+	leaders []uint64
 
 	// buckets is a map from bucket ID to leader ID
 	buckets map[BucketID]NodeID
@@ -86,6 +90,7 @@ type epoch struct {
 
 	sequences []*sequence
 
+	ending            bool // set when this epoch about to end gracefully
 	lowestUncommitted int
 	lowestUnallocated []int // index by bucket
 
@@ -109,10 +114,24 @@ func newEpoch(newEpochConfig *pb.EpochConfig, checkpointTracker *checkpointTrack
 		plannedExpiration: newEpochConfig.StartingCheckpoint.SeqNo + networkConfig.MaxEpochLength,
 		networkConfig:     networkConfig,
 		buckets:           map[BucketID]NodeID{},
+		leaders:           newEpochConfig.Leaders,
 	}
 
+	leaders := map[uint64]struct{}{}
+	for _, leader := range newEpochConfig.Leaders {
+		leaders[leader] = struct{}{}
+	}
+
+	overflowIndex := 0 // TODO, this should probably start after the last assigned node
 	for i := 0; i < int(networkConfig.NumberOfBuckets); i++ {
-		config.buckets[BucketID(i)] = NodeID(newEpochConfig.Leaders[i%len(newEpochConfig.Leaders)])
+		bucketID := BucketID(i)
+		leader := networkConfig.Nodes[(uint64(i)+newEpochConfig.Number)%uint64(len(networkConfig.Nodes))]
+		if _, ok := leaders[leader]; !ok {
+			config.buckets[bucketID] = NodeID(newEpochConfig.Leaders[overflowIndex%len(newEpochConfig.Leaders)])
+			overflowIndex++
+		} else {
+			config.buckets[bucketID] = NodeID(leader)
+		}
 	}
 
 	checkpoints := make([]*checkpoint, 0, 3)
@@ -176,7 +195,7 @@ func newEpoch(newEpochConfig *pb.EpochConfig, checkpointTracker *checkpointTrack
 
 					continue outer
 				} else {
-					panic(fmt.Sprintf("we need persistence and or state transfer to handle this path, epoch=%d seqno=%d digest=%x bucket=%d", newSeq.epoch, newSeq.seqNo, newSeq.digest, config.seqToBucket(newSeq.seqNo)))
+					myConfig.Logger.Panic("we need persistence and or state transfer to handle this path", zap.Uint64("Epoch", newSeq.epoch), zap.Uint64("SeqNo", newSeq.seqNo), zap.Binary("Digest", newSeq.digest), zap.Uint64("Bucket", uint64(config.seqToBucket(newSeq.seqNo))))
 				}
 				break
 			}
@@ -290,16 +309,15 @@ func (e *epoch) advanceUncommitted() *Actions {
 func (e *epoch) moveWatermarks() *Actions {
 	lastCW := e.checkpoints[len(e.checkpoints)-1]
 
-	if e.config.plannedExpiration == lastCW.end {
-		// This epoch is about to end gracefully, don't allocate new windows
-		// so no need to go into allocation or garbage collection logic.
-		return &Actions{}
-	}
-
 	secondToLastCW := e.checkpoints[len(e.checkpoints)-2]
 	ci := int(e.config.networkConfig.CheckpointInterval)
 
-	if secondToLastCW.stable {
+	// If this epoch is ending, don't allocate new sequences
+	if lastCW.end == e.config.plannedExpiration {
+		e.ending = true
+	}
+
+	if secondToLastCW.stable && !e.ending {
 		for i := 0; i < ci; i++ {
 			seqNo := lastCW.end + uint64(i) + 1
 			epoch := e.config.number
@@ -335,7 +353,12 @@ func (e *epoch) advanceLowestUnallocated() {
 			// not have skipped the sequences we didn't own and now be negative.
 			e.lowestUnallocated[bucketID] = 0
 		}
-		for i := e.lowestUnallocated[bucketID]; i < len(e.sequences); i++ {
+		for i := e.lowestUnallocated[bucketID]; i <= len(e.sequences); i++ {
+			if i == len(e.sequences) {
+				e.lowestUnallocated[bucketID] = i
+				break
+			}
+
 			seq := e.sequences[i]
 			e.lowestUnallocated[bucketID] = i
 			if seq.state != Uninitialized || e.config.seqToBucket(seq.seqNo) != BucketID(bucketID) {
@@ -358,12 +381,12 @@ func (e *epoch) drainProposer() *Actions {
 			e.advanceLowestUnallocated()
 
 			i := e.lowestUnallocated[int(bucketID)]
-			if i > len(e.sequences) {
+			if i >= len(e.sequences) {
 				break
 			}
 			seq := e.sequences[i]
 
-			if len(e.sequences)-i <= int(e.config.networkConfig.CheckpointInterval) {
+			if len(e.sequences)-i <= int(e.config.networkConfig.CheckpointInterval) && !e.ending {
 				// let the network move watermarks before filling up the last checkpoint
 				// interval
 				break
@@ -390,46 +413,53 @@ func (e *epoch) applyProcessResult(seqNo uint64, digest []byte) *Actions {
 }
 
 func (e *epoch) tick() *Actions {
-	actions := &Actions{} // TODO, only heartbeat if no progress
-	if e.myConfig.HeartbeatTicks != 0 && e.ticks%uint64(e.myConfig.HeartbeatTicks) == 0 {
-		e.advanceLowestUnallocated()
-		for bucketID, index := range e.lowestUnallocated {
-			if e.config.buckets[BucketID(bucketID)] != NodeID(e.myConfig.ID) {
-				continue
-			}
-
-			if len(e.sequences)-index <= int(e.config.networkConfig.CheckpointInterval) {
-				continue
-			}
-
-			if e.proposer.hasOutstanding(BucketID(bucketID)) {
-				proposals := e.proposer.next(BucketID(bucketID))
-				actions.Append(e.sequences[index].allocate(proposals))
-			} else {
-				actions.Append(e.sequences[index].allocate(nil))
-			}
-		}
+	if e.lowestUncommitted < len(e.sequences) && e.sequences[e.lowestUncommitted].seqNo != e.lastCommittedAtTick+1 {
+		e.ticksSinceProgress = 0
+		e.lastCommittedAtTick = e.sequences[e.lowestUncommitted].seqNo - 1
+		return &Actions{}
 	}
 
-	if e.lowestUncommitted >= len(e.sequences) || e.sequences[e.lowestUncommitted].seqNo == e.lastCommittedAtTick+1 {
-		e.ticksSinceProgress++
-		if e.ticksSinceProgress > e.myConfig.SuspectTicks {
-			return &Actions{
-				Broadcast: []*pb.Msg{
-					{
-						Type: &pb.Msg_Suspect{
-							Suspect: &pb.Suspect{
-								Epoch: e.config.number,
-							},
+	e.ticksSinceProgress++
+	actions := &Actions{}
+
+	if e.ticksSinceProgress > e.myConfig.SuspectTicks {
+		actions.Append(&Actions{
+			Broadcast: []*pb.Msg{
+				{
+					Type: &pb.Msg_Suspect{
+						Suspect: &pb.Suspect{
+							Epoch: e.config.number,
 						},
 					},
 				},
-			}
-		}
+			},
+		})
+	}
+
+	if e.myConfig.HeartbeatTicks == 0 || e.ticksSinceProgress%e.myConfig.HeartbeatTicks != 0 {
 		return actions
-	} else {
-		e.ticksSinceProgress = 0
-		e.lastCommittedAtTick = e.sequences[e.lowestUncommitted].seqNo - 1
+	}
+
+	e.advanceLowestUnallocated()
+	for bucketID, index := range e.lowestUnallocated {
+		if index >= len(e.sequences) {
+			continue
+		}
+
+		if e.config.buckets[BucketID(bucketID)] != NodeID(e.myConfig.ID) {
+			continue
+		}
+
+		if len(e.sequences)-index <= int(e.config.networkConfig.CheckpointInterval) && !e.ending {
+			continue
+		}
+
+		if e.proposer.hasOutstanding(BucketID(bucketID)) {
+			proposals := e.proposer.next(BucketID(bucketID))
+			actions.Append(e.sequences[index].allocate(proposals))
+		} else {
+			actions.Append(e.sequences[index].allocate(nil))
+		}
 	}
 
 	return actions

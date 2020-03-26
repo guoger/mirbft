@@ -90,17 +90,9 @@ func (s *Status) Pretty() string {
 	buffer.WriteString("\n")
 
 	hRule := func() {
-		for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo++ {
+		for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo += uint64(len(s.Buckets)) {
 			buffer.WriteString("--")
 		}
-	}
-
-	for i := len(fmt.Sprintf("%d", s.HighWatermark)); i > 0; i-- {
-		magnitude := math.Pow10(i - 1)
-		for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo++ {
-			buffer.WriteString(fmt.Sprintf(" %d", seqNo/uint64(magnitude)%10))
-		}
-		buffer.WriteString("\n")
 	}
 
 	if s.LowWatermark == s.HighWatermark {
@@ -108,11 +100,24 @@ func (s *Status) Pretty() string {
 		return buffer.String()
 	}
 
+	if s.HighWatermark-s.LowWatermark > 10000 {
+		buffer.WriteString(fmt.Sprintf("=== Suspiciously wide watermarks [%d, %d] ===\n", s.LowWatermark, s.HighWatermark))
+		return buffer.String()
+	}
+
+	for i := len(fmt.Sprintf("%d", s.HighWatermark)); i > 0; i-- {
+		magnitude := math.Pow10(i - 1)
+		for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo += uint64(len(s.Buckets)) {
+			buffer.WriteString(fmt.Sprintf(" %d", seqNo/uint64(magnitude)%10))
+		}
+		buffer.WriteString("\n")
+	}
+
 	for _, nodeStatus := range s.Nodes {
 		hRule()
 		buffer.WriteString(fmt.Sprintf("- === Node %d === \n", nodeStatus.ID))
 		for bucket, bucketStatus := range nodeStatus.BucketStatuses {
-			for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo++ {
+			for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo += uint64(len(s.Buckets)) {
 				if seqNo == nodeStatus.LastCheckpoint {
 					buffer.WriteString("|X")
 					continue
@@ -169,10 +174,10 @@ func (s *Status) Pretty() string {
 	hRule()
 	buffer.WriteString("- === Checkpoints ===\n")
 	i := 0
-	for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo++ {
+	for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo += uint64(len(s.Buckets)) {
 		if len(s.Checkpoints) > i {
 			checkpoint := s.Checkpoints[i]
-			if seqNo == checkpoint.SeqNo/uint64(len(s.Buckets)) {
+			if seqNo == checkpoint.SeqNo {
 				buffer.WriteString(fmt.Sprintf("|%d", checkpoint.MaxAgreements))
 				i++
 				continue
@@ -182,7 +187,7 @@ func (s *Status) Pretty() string {
 	}
 	buffer.WriteString("| Max Agreements\n")
 	i = 0
-	for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo++ {
+	for seqNo := s.LowWatermark; seqNo <= s.HighWatermark; seqNo += uint64(len(s.Buckets)) {
 		if len(s.Checkpoints) > i {
 			checkpoint := s.Checkpoints[i]
 			if seqNo == s.Checkpoints[i].SeqNo/uint64(len(s.Buckets)) {

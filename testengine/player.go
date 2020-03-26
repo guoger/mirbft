@@ -77,7 +77,17 @@ func NewPlayer(el *EventLog, logger *zap.Logger) (*Player, error) {
 
 func (p *Player) Step() error {
 	event := p.EventLog.ConsumeAndAdvance()
+	if event == nil {
+		return errors.Errorf("event log has no more events")
+	}
 	p.LastEvent = event
+
+	if event.Dropped {
+		// We allow the log to encode events which were set to be processed, but were
+		// deliberatley dropped by some mangler.  This makes it easier to review event logs
+		// identifying why tests failed.
+		return nil
+	}
 
 	if event.Target >= uint64(len(p.Nodes)) {
 		return errors.Errorf("event log referenced a node %d which does not exist", event.Target)
@@ -137,6 +147,24 @@ func (p *Player) Step() error {
 	case *tpb.Event_Process_:
 		if node.Processing != nil {
 			return errors.Errorf("node %d is currently processing but got a second process event", event.Target)
+		}
+
+		for _, msg := range node.Actions.Broadcast {
+			err := node.Node.Step(context.Background(), event.Target, msg)
+			if err != nil {
+				return errors.WithMessagef(err, "node %d could not step message to self", event.Target)
+			}
+		}
+
+		for _, unicast := range node.Actions.Unicast {
+			if unicast.Target != event.Target {
+				continue
+			}
+			// It's a bit weird to unicast to ourselves, but let's handle it.
+			err := node.Node.Step(context.Background(), event.Target, unicast.Msg)
+			if err != nil {
+				return errors.WithMessagef(err, "node %d could not step message to self", event.Target)
+			}
 		}
 
 		node.Processing = node.Actions

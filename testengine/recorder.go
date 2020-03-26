@@ -8,11 +8,11 @@ package testengine
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"math/rand"
 	"time"
 
 	"github.com/IBM/mirbft"
@@ -61,12 +61,19 @@ func (rc *RecorderClient) RequestByReqNo(reqNo uint64) *pb.RequestData {
 	}
 }
 
+type CommitList struct {
+	Commit *mirbft.Commit
+	Next   *CommitList
+}
+
 type NodeState struct {
 	LastCommittedSeqNo uint64
 	OutstandingCommits []*mirbft.Commit
 	Hasher             hash.Hash
 	Value              []byte
 	Length             uint64
+	FirstCommit        *CommitList
+	LastCommit         *CommitList
 }
 
 func (ns *NodeState) Commit(commits []*mirbft.Commit, node uint64) []*tpb.Checkpoint {
@@ -89,6 +96,18 @@ func (ns *NodeState) Commit(commits []*mirbft.Commit, node uint64) []*tpb.Checkp
 			break
 		}
 		i++
+
+		if ns.FirstCommit == nil {
+			ns.FirstCommit = &CommitList{
+				Commit: commit,
+			}
+			ns.LastCommit = ns.FirstCommit
+		} else {
+			ns.LastCommit.Next = &CommitList{
+				Commit: commit,
+			}
+			ns.LastCommit = ns.LastCommit.Next
+		}
 
 		for _, request := range commit.QEntry.Requests {
 			ns.Hasher.Write(request.Digest)
@@ -129,8 +148,10 @@ type Recorder struct {
 	NetworkConfig *pb.NetworkConfig
 	NodeConfigs   []*tpb.NodeConfig
 	ClientConfigs []*ClientConfig
+	Manglers      []Mangler
 	Logger        *zap.Logger
 	Hasher        Hasher
+	RandomSeed    int64
 }
 
 func (r *Recorder) Recording() (*Recording, error) {
@@ -184,7 +205,13 @@ func (r *Recorder) Recording() (*Recording, error) {
 		Player:   player,
 		Nodes:    nodes,
 		Clients:  clients,
+		Manglers: r.Manglers,
+		Rand:     rand.New(rand.NewSource(r.RandomSeed)),
 	}, nil
+}
+
+type Mangler interface {
+	BeforeStep(random int, el *EventLog)
 }
 
 type Recording struct {
@@ -193,15 +220,29 @@ type Recording struct {
 	Player   *Player
 	Nodes    []*RecorderNode
 	Clients  []*RecorderClient
+	Manglers []Mangler
+	Rand     *rand.Rand
 }
 
 func (r *Recording) Step() error {
+	if r.EventLog.NextEventLogEntry == nil {
+		return errors.Errorf("event log is empty, nothing to do")
+	}
+
+	for _, mangler := range r.Manglers {
+		mangler.BeforeStep(r.Rand.Int(), r.EventLog)
+	}
+
 	err := r.Player.Step()
 	if err != nil {
 		return errors.WithMessagef(err, "could not step recorder's underlying player")
 	}
 
 	lastEvent := r.Player.LastEvent
+	if lastEvent.Dropped {
+		return nil
+	}
+
 	node := r.Nodes[int(lastEvent.Target)]
 	nodeConfig := node.Config
 	playbackNode := node.PlaybackNode
@@ -235,28 +276,21 @@ func (r *Recording) Step() error {
 		processing := playbackNode.Processing
 		for _, msg := range processing.Broadcast {
 			for i := range r.Player.Nodes {
-				if uint64(i) != lastEvent.Target {
-					r.EventLog.InsertRecv(uint64(i), lastEvent.Target, msg, uint64(nodeConfig.LinkLatency))
-				} else {
-					// Send it to ourselves with no latency
-					err := playbackNode.Node.Step(context.Background(), lastEvent.Target, msg)
-					if err != nil {
-						return errors.WithMessagef(err, "node %d could not step message to self", lastEvent.Target)
-					}
+				if uint64(i) == lastEvent.Target {
+					// We've already sent it to ourselves
+					continue
 				}
+				r.EventLog.InsertRecv(uint64(i), lastEvent.Target, msg, uint64(nodeConfig.LinkLatency))
 			}
 		}
 
 		for _, unicast := range processing.Unicast {
-			if unicast.Target != lastEvent.Target {
-				r.EventLog.InsertRecv(unicast.Target, lastEvent.Target, unicast.Msg, uint64(nodeConfig.LinkLatency))
-			} else {
-				// Send it to ourselves with no latency
-				err := playbackNode.Node.Step(context.Background(), lastEvent.Target, unicast.Msg)
-				if err != nil {
-					return errors.WithMessagef(err, "node %d could not step message to self", lastEvent.Target)
-				}
+			if unicast.Target == lastEvent.Target {
+				// We've already sent it to ourselves
+				continue
 			}
+
+			r.EventLog.InsertRecv(unicast.Target, lastEvent.Target, unicast.Msg, uint64(nodeConfig.LinkLatency))
 		}
 
 		apply := &tpb.Event_Apply{
@@ -350,7 +384,7 @@ func (r *Recording) DrainClients(timeout time.Duration) (int, error) {
 		}
 
 		if time.Since(start) > timeout {
-			return 0, errors.Errorf("timed out")
+			return 0, errors.Errorf("timed out after %d entries", r.EventLog.Count())
 		}
 	}
 }

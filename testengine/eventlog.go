@@ -23,6 +23,7 @@ import (
 type EventLogEntry struct {
 	Event *tpb.Event
 	Next  *EventLogEntry
+	Prev  *EventLogEntry
 }
 
 type EventLog struct {
@@ -32,6 +33,7 @@ type EventLog struct {
 	NodeConfigs        []*tpb.NodeConfig
 	FirstEventLogEntry *EventLogEntry
 	NextEventLogEntry  *EventLogEntry
+	LastConsumed       *EventLogEntry
 	FakeTime           uint64
 }
 
@@ -151,6 +153,7 @@ func ReadEventLog(source io.Reader) (el *EventLog, err error) {
 				eventLog.FirstEventLogEntry = eventLogEntry
 				eventLog.NextEventLogEntry = eventLogEntry
 			} else {
+				eventLogEntry.Prev = eventLog.NextEventLogEntry
 				eventLog.NextEventLogEntry.Next = eventLogEntry
 				eventLog.NextEventLogEntry = eventLogEntry
 			}
@@ -160,6 +163,9 @@ func ReadEventLog(source io.Reader) (el *EventLog, err error) {
 	if eventLog == nil {
 		return nil, errors.Errorf("file ended before initial scenario")
 	}
+
+	// Reset the cursor to the beginning of the log
+	eventLog.NextEventLogEntry = eventLog.FirstEventLogEntry
 
 	return eventLog, nil
 }
@@ -172,6 +178,7 @@ func (l *EventLog) ConsumeAndAdvance() *tpb.Event {
 
 	l.FakeTime = nele.Event.Time
 	l.NextEventLogEntry = nele.Next
+	l.LastConsumed = nele
 	return nele.Event
 }
 
@@ -237,21 +244,48 @@ func (l *EventLog) Insert(event *tpb.Event) {
 
 	if l.FirstEventLogEntry == nil {
 		l.FirstEventLogEntry = logEntry
+		l.NextEventLogEntry = logEntry
+		return
 	}
 
-	if l.NextEventLogEntry == nil || event.Time < l.NextEventLogEntry.Event.Time {
-		logEntry.Next = l.NextEventLogEntry
+	if l.NextEventLogEntry == nil {
 		l.NextEventLogEntry = logEntry
+		l.LastConsumed.Next = logEntry
+		logEntry.Prev = l.LastConsumed
 		return
 	}
 
 	currentEntry := l.NextEventLogEntry
 	for {
-		if currentEntry.Next == nil || currentEntry.Next.Event.Time > event.Time {
-			logEntry.Next = currentEntry.Next
+		if currentEntry.Event.Time > event.Time {
+			logEntry.Next = currentEntry
+			logEntry.Prev = currentEntry.Prev
+			currentEntry.Prev = logEntry
+			if logEntry.Prev != nil {
+				logEntry.Prev.Next = logEntry
+			}
+			if currentEntry == l.NextEventLogEntry {
+				l.NextEventLogEntry = logEntry
+			}
+			if currentEntry == l.FirstEventLogEntry {
+				l.FirstEventLogEntry = logEntry
+			}
+			return
+		}
+
+		if currentEntry.Next == nil {
 			currentEntry.Next = logEntry
+			logEntry.Prev = currentEntry
 			return
 		}
 		currentEntry = currentEntry.Next
 	}
+}
+
+func (l *EventLog) Count() int {
+	total := 0
+	for event := l.FirstEventLogEntry; event != nil; event = event.Next {
+		total++
+	}
+	return total
 }

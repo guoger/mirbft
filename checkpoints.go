@@ -8,6 +8,7 @@ package mirbft
 
 import (
 	"bytes"
+	"sort"
 
 	pb "github.com/IBM/mirbft/mirbftpb"
 )
@@ -36,7 +37,7 @@ func newCheckpointTracker(networkConfig *pb.NetworkConfig, myConfig *Config) *ch
 func (ct *checkpointTracker) checkpoint(seqNo uint64) *checkpoint {
 	cp, ok := ct.checkpoints[seqNo]
 	if !ok {
-		cp = newCheckpoint(seqNo-uint64(ct.networkConfig.CheckpointInterval), seqNo, ct.networkConfig, ct.myConfig)
+		cp = newCheckpoint(seqNo, ct.networkConfig, ct.myConfig)
 		ct.checkpoints[seqNo] = cp
 	}
 
@@ -57,8 +58,22 @@ func (ct *checkpointTracker) release(cp *checkpoint) {
 	delete(ct.checkpoints, cp.end)
 }
 
+func (ct *checkpointTracker) status() []*CheckpointStatus {
+	result := make([]*CheckpointStatus, len(ct.checkpoints))
+	i := 0
+	for _, cp := range ct.checkpoints {
+		result[i] = cp.status()
+		i++
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].SeqNo < result[j].SeqNo
+	})
+
+	return result
+}
+
 type checkpoint struct {
-	start         uint64
 	end           uint64
 	myConfig      *Config
 	networkConfig *pb.NetworkConfig
@@ -70,9 +85,8 @@ type checkpoint struct {
 	obsolete       bool
 }
 
-func newCheckpoint(start, end uint64, config *pb.NetworkConfig, myConfig *Config) *checkpoint {
+func newCheckpoint(end uint64, config *pb.NetworkConfig, myConfig *Config) *checkpoint {
 	return &checkpoint{
-		start:         start,
 		end:           end,
 		networkConfig: config,
 		myConfig:      myConfig,
